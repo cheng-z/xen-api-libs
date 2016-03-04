@@ -13,7 +13,7 @@
  *)
 (* Copyright (C) 2007 XenSource Inc *)
 
-module D=Debug.Make(struct let name="stunnel" end)
+module D=Debug.Debugger(struct let name="stunnel" end)
 open D
 let trim = String.trim
 
