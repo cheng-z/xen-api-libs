@@ -15,7 +15,6 @@
 
 module D=Debug.Debugger(struct let name="stunnel" end)
 open D
-let trim = String.trim
 
 open Printf
 open Pervasiveext
@@ -178,7 +177,7 @@ let set_legacy_protocol_and_ciphersuites_allowed b =
 
 let set_good_ciphersuites s =
 	info "set_good_ciphersuites received %S" s;
-	if trim s <> "" then (
+	if String.filter_chars s (not ++ String.isspace) <> "" then (
 		good_ciphersuites := Some s
 	) else raise (Stunnel_error
 		("Stunnel.set_good_ciphersuites received a blank or empty string. Leaving it unchanged as " ^
