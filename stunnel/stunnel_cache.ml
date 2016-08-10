@@ -23,14 +23,34 @@
 module D=Debug.Debugger(struct let name="stunnel_cache" end)
 open D
 
-type endpoint = { host: string; port: int }
+(* Disable debug-level logging but leave higher-priority enabled.  It would be
+ * better to handle this sort of configuration in the Debug module itself.
+ *)
+let debug_enabled = false
+
+let ignore_log fmt =
+    Printf.ksprintf (fun s -> ()) fmt
+
+(* Use and overlay the definition from D. *)
+let debug = if debug_enabled then debug else ignore_log
+
+type endpoint = { host: string; port: int; verified: bool }
+
+(* Need to limit the absolute number of stunnels as well as the maximum age *)
+let max_stunnel = 22
+let max_age = 180. *. 60. (* seconds *)
+let max_idle = 5. *. 60. (* seconds *)
+
+(* The add function adds the new stunnel before doing gc, so the cache *)
+(* can briefly contain one more than maximum. *)
+let capacity = max_stunnel + 1
 
 (** An index of endpoints to stunnel IDs *)
-let index : (endpoint, int list) Hashtbl.t ref = ref (Hashtbl.create 10)
+let index : (endpoint, int list) Hashtbl.t ref = ref (Hashtbl.create capacity)
 (** A mapping of stunnel unique IDs to donation times *)
-let times : (int, float) Hashtbl.t ref = ref (Hashtbl.create 10)
+let times : (int, float) Hashtbl.t ref = ref (Hashtbl.create capacity)
 (** A mapping of stunnel unique ID to Stunnel.t *)
-let stunnels : (int, Stunnel.t) Hashtbl.t ref = ref (Hashtbl.create 10)
+let stunnels : (int, Stunnel.t) Hashtbl.t ref = ref (Hashtbl.create capacity)
 
 open Pervasiveext
 open Threadext
@@ -38,42 +58,42 @@ open Listext
 
 let m = Mutex.create ()
 
-(* Need to limit the absolute number of stunnels as well as the maximum age *)
-let max_stunnel = 4
-let max_age = 5. *. 60. (* seconds *)
-let max_idle = 2. *. 60. (* seconds *)
-
 let id_of_stunnel stunnel = 
     Opt.default "unknown" (Opt.map string_of_int stunnel.Stunnel.unique_id)
 
 let unlocked_gc () = 
-  let now = Unix.gettimeofday () in
-  let string_of_id id = 
-    let stunnel = Hashtbl.find !stunnels id in
-    Printf.sprintf "(id %s / idle %.2f age %.2f)" 
-      (id_of_stunnel stunnel)
-      (now -. (Hashtbl.find !times id))
-      (now -. stunnel.Stunnel.connected_time) in
-  let string_of_endpoint ep = Printf.sprintf "%s:%d" ep.host ep.port in
-  let string_of_index ep xs = Printf.sprintf "[ %s %s ]" (string_of_endpoint ep) (String.concat "; " (List.map string_of_id xs)) in
-  debug "Cache contents: %s" (Hashtbl.fold (fun ep xs acc -> string_of_index ep xs ^ " " ^ acc) !index "");
+	if debug_enabled then begin
+		let now = Unix.gettimeofday () in
+		let string_of_id id = 
+			let stunnel = Hashtbl.find !stunnels id in
+			Printf.sprintf "(id %s / idle %.2f age %.2f)" 
+				(id_of_stunnel stunnel)
+				(now -. (Hashtbl.find !times id))
+				(now -. stunnel.Stunnel.connected_time) in
+		let string_of_endpoint ep = Printf.sprintf "%s:%d" ep.host ep.port in
+		let string_of_index ep xs = Printf.sprintf "[ %s %s ]" (string_of_endpoint ep) (String.concat "; " (List.map string_of_id xs)) in
+		debug "Cache contents: %s" (Hashtbl.fold (fun ep xs acc -> string_of_index ep xs ^ " " ^ acc) !index "");
+	end;
 
   let all_ids = Hashtbl.fold (fun k _ acc -> k :: acc) !stunnels [] in
 
   let to_gc = ref [] in
-  (* Find the ones which are too old *)
+  (* Find the ones which are too old or have unwanted legacy config *)
   let now = Unix.gettimeofday () in
   Hashtbl.iter
     (fun idx stunnel ->
        let time = Hashtbl.find !times idx in
        let idle = now -. time in
        let age = now -. stunnel.Stunnel.connected_time in
-       if age > max_age then begin
-	 debug "Expiring stunnel id %s; age (%.2f) > limit (%.2f)" (id_of_stunnel stunnel) age max_age;
-	 to_gc := idx :: !to_gc
+       if stunnel.Stunnel.legacy && not (Stunnel.is_legacy_protocol_and_ciphersuites_allowed ()) then (
+         info "Expiring stunnel id %s because it is legacy-mode." (id_of_stunnel stunnel);
+         to_gc := idx :: !to_gc
+       ) else if age > max_age then begin
+         debug "Expiring stunnel id %s; age (%.2f) > limit (%.2f)" (id_of_stunnel stunnel) age max_age;
+         to_gc := idx :: !to_gc
        end else if idle > max_idle then begin
-	 debug "Expiring stunnel id %s; idle (%.2f) > limit (%.2f)" (id_of_stunnel stunnel) age max_idle;
-	 to_gc := idx :: !to_gc
+         debug "Expiring stunnel id %s; idle (%.2f) > limit (%.2f)" (id_of_stunnel stunnel) age max_idle;
+         to_gc := idx :: !to_gc
        end) !stunnels;
   let num_remaining = List.length all_ids - (List.length !to_gc) in
   if num_remaining > max_stunnel then begin
@@ -95,10 +115,13 @@ let unlocked_gc () =
 	       let s = Hashtbl.find !stunnels id in
 	       Stunnel.disconnect s) !to_gc;
   (* Remove all reference to them from our cache hashtables *)
-  let index' = Hashtbl.create 10 in
+  let index' = Hashtbl.create capacity in
   Hashtbl.iter
     (fun ep ids ->
-       Hashtbl.add index' ep (List.filter (fun id -> not(List.mem id !to_gc)) ids)) !index;
+      let kept_ids = (List.filter (fun id -> not(List.mem id !to_gc)) ids) in
+      if kept_ids != [] then Hashtbl.add index' ep kept_ids
+      else ()
+    ) !index;
   let times' = Hashtbl.copy !times in
   List.iter (fun idx -> Hashtbl.remove times' idx) !to_gc;
   let stunnels' = Hashtbl.copy !stunnels in
@@ -112,29 +135,34 @@ let gc () = Mutex.execute m unlocked_gc
 
 let counter = ref 0
 
-let add (x: Stunnel.t) = 
-  let now = Unix.gettimeofday () in
-  Mutex.execute m
-    (fun () ->
-       let idx = !counter in
-       incr counter;
-       Hashtbl.add !times idx now;
-       Hashtbl.add !stunnels idx x;
-       let ep = { host = x.Stunnel.host; port = x.Stunnel.port } in
-       let existing = 
-	 if Hashtbl.mem !index ep
-	 then Hashtbl.find !index ep
-	 else [] in
-       Hashtbl.replace !index ep (idx :: existing);
-       debug "Adding stunnel id %s (idle %.2f) to the cache"
-	     (id_of_stunnel x) 0.;
-       unlocked_gc ()
-    )
-  
+let add (x: Stunnel.t) =
+	if x.Stunnel.legacy && not (Stunnel.is_legacy_protocol_and_ciphersuites_allowed ()) then (
+		info "Legacy-protocol stunnel (id=%s) not allowed in cache: disconnecting." (id_of_stunnel x);
+		Stunnel.disconnect ~force:true x
+	) else (
+		let now = Unix.gettimeofday () in
+		Mutex.execute m (fun () ->
+			let idx = !counter in
+			incr counter;
+			Hashtbl.add !times idx now;
+			Hashtbl.add !stunnels idx x;
+			let ep = { host = x.Stunnel.host; port = x.Stunnel.port; verified = x.Stunnel.verified } in
+			let existing =
+				if Hashtbl.mem !index ep
+				then Hashtbl.find !index ep
+				else [] in
+			Hashtbl.replace !index ep (idx :: existing);
+			debug "Adding stunnel id %s (idle %.2f) to the cache"
+				(id_of_stunnel x) 0.;
+			unlocked_gc ()
+		)
+	)
+
 (** Returns an Stunnel.t for this endpoint (oldest first), raising Not_found
-    if none can be found *)
-let remove host port = 
-  let ep = { host = host; port = port } in
+    if none can be found. First performs a garbage-collection, which discards
+    legacy-config and expired stunnels if needed. *)
+let remove host port verified =
+  let ep = { host = host; port = port; verified = verified } in
   Mutex.execute m
     (fun () ->
        unlocked_gc ();
@@ -159,7 +187,7 @@ let remove host port =
 let flush () =
   Mutex.execute m 
     (fun () ->
-      info "Flushing cache";
+      info "Flushing cache of all %d stunnels." (Hashtbl.length !stunnels);
       Hashtbl.iter (fun id st -> Stunnel.disconnect st) !stunnels;
       Hashtbl.clear !stunnels;
       Hashtbl.clear !times;
@@ -167,10 +195,9 @@ let flush () =
       info "Flushed!")
 
 
-let connect ?use_fork_exec_helper ?write_to_log host port =
+let connect ?use_fork_exec_helper ?write_to_log host port verify_cert =
   try
-    remove host port
+    remove host port verify_cert
   with Not_found ->
-    error "Failed to find stunnel in cache for endpoint %s:%d" host port;
-    Stunnel.connect ?use_fork_exec_helper ?write_to_log host port
-    
+    info "connect did not find cached stunnel for endpoint %s:%d" host port;
+    Stunnel.connect ?use_fork_exec_helper ?write_to_log ~verify_cert host port

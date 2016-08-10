@@ -13,6 +13,9 @@
  *)
 (* Copyright (C) 2007 XenSource Inc *)
 
+module D=Debug.Debugger(struct let name="stunnel" end)
+open D
+
 open Printf
 open Pervasiveext
 open Stringext
@@ -32,6 +35,15 @@ let cached_stunnel_path = ref None
 let stunnel_logger = ref ignore
 
 let timeoutidle = ref None
+
+(* Use good settings by default *)
+let legacy_protocol_and_ciphersuites_allowed = ref false
+
+let is_legacy_protocol_and_ciphersuites_allowed () =
+	!legacy_protocol_and_ciphersuites_allowed
+
+let good_ciphersuites = ref (Some "!EXPORT:RSA+AES128-SHA256")
+let legacy_ciphersuites = ref "RSA+AES256-SHA:RSA+AES128-SHA:RSA+RC4-SHA:RSA+DES-CBC3-SHA"
 
 let init_stunnel_path () =
 	try cached_stunnel_path := Some (Unix.getenv "XE_STUNNEL")
@@ -115,50 +127,102 @@ type t = { mutable pid: pid; fd: Unix.file_descr; host: string; port: int;
 	   connected_time: float;
 	   unique_id: int option;
 	   mutable logfile: string;
+	   verified: bool;
+	   legacy: bool;
 	 }
 
-let config_file verify_cert extended_diagnosis host port = 
-	let lines = ["client=yes"; "foreground=yes"; "socket = r:TCP_NODELAY=1"; "socket = r:SO_KEEPALIVE=1"; "socket = a:SO_KEEPALIVE=1";
-							 (match !timeoutidle with None -> "" | Some x -> Printf.sprintf "TIMEOUTidle = %d" x);
-							 Printf.sprintf "connect=%s:%d" host port] @
-    (if extended_diagnosis then
-       ["debug=4"]
-     else
-       []) @
-    (if verify_cert then
-       ["verify=2";
-        sprintf "CApath=%s" certificate_path;
-        sprintf "CRLpath=%s" crl_path]
-     else
-       [])
+let config_file verify_cert extended_diagnosis host port legacy =
+
+	let good_ciphers () = match !good_ciphersuites with
+		| None -> raise (Stunnel_error "good_ciphersuites is unset in the OCaml Stunnel module.")
+		| Some s -> s
+	in
+
+	let lines = [
+		"client=yes"; "foreground=yes"; "socket = r:TCP_NODELAY=1"; "socket = r:SO_KEEPALIVE=1"; "socket = a:SO_KEEPALIVE=1";
+		(match !timeoutidle with None -> "" | Some x -> Printf.sprintf "TIMEOUTidle = %d" x);
+		Printf.sprintf "connect=%s:%d" host port;
+		"fips = no"; (* stunnel fips-mode stops us using sslVersion other than TLSv1 which means 1.0 only. *)
+	] @	(if extended_diagnosis then
+			["debug=4"]
+		else
+			[]
+	) @ (
+		if verify_cert then
+			["verify=2";
+			sprintf "CApath=%s" certificate_path;
+			sprintf "CRLpath=%s" crl_path]
+		else
+			[]
+	) @ (
+		if legacy then [
+			"sslVersion = all";
+			"options = NO_SSLv2";
+			"options = NO_SSLv3";
+			"ciphers = " ^ (good_ciphers ()) ^ (match !legacy_ciphersuites with "" -> "" | s -> (":" ^ s))
+		] else [
+			"sslVersion = TLSv1.2";
+			"ciphers = " ^ (good_ciphers ());
+		]
+	)
   in
     String.concat "" (List.map (fun x -> x ^ "\n") lines)
 
+let set_legacy_protocol_and_ciphersuites_allowed b =
+	legacy_protocol_and_ciphersuites_allowed := b;
+	info "legacy-config %B; example: %S" b
+		(match !good_ciphersuites with
+			| None -> "(Ciphersuites are not configured.)"
+			| _ -> config_file false false "dummyhost" 443 b)
+
+let set_good_ciphersuites s =
+	info "set_good_ciphersuites received %S" s;
+	if String.filter_chars s (not ++ String.isspace) <> "" then (
+		good_ciphersuites := Some s
+	) else raise (Stunnel_error
+		("Stunnel.set_good_ciphersuites received a blank or empty string. Leaving it unchanged as " ^
+			(match !good_ciphersuites with None -> "None" | Some s -> ("Some " ^ (String.escaped s)))
+		)
+	)
+
+let set_legacy_ciphersuites s =
+	legacy_ciphersuites := s;
+	info "set_legacy_ciphersuites: %S" s
+
 let ignore_exn f x = try f x with _ -> ()
 
-let rec disconnect ?(wait = true) ?(force = false) x = 
+let rec disconnect ?(wait = true) ?(force = false) x =
   List.iter (ignore_exn Unix.close) [ x.fd ];
-  let waiter, pid = match x.pid with
-    | FEFork pid ->
-        (fun () -> 
-           (if wait then Forkhelpers.waitpid 
-            else Forkhelpers.waitpid_nohang) pid),
-        Forkhelpers.getpid pid
-    | StdFork pid -> 
-        (fun () -> 
-           (if wait then Unix.waitpid [] 
-            else Unix.waitpid [Unix.WNOHANG]) pid),
-        pid in
-  let res = 
-    try waiter ()
-    with Unix.Unix_error (Unix.ECHILD, _, _) -> pid, Unix.WEXITED 0 in
-  match res with
-  | 0, _ when force ->
-      (try Unix.kill pid Sys.sigkill 
-       with Unix.Unix_error (Unix.ESRCH, _, _) ->());
-      disconnect ~wait:wait ~force:force x
-  | _ -> ()
 
+  let do_disc waiter pid =
+    let res =
+      try waiter ()
+      with Unix.Unix_error (Unix.ECHILD, _, _) -> pid, Unix.WEXITED 0 in
+    match res with
+    | 0, _ when force ->
+        (try Unix.kill pid Sys.sigkill 
+         with Unix.Unix_error (Unix.ESRCH, _, _) ->());
+        disconnect ~wait:wait ~force:force x
+    | _ -> ()
+  in
+  let verbose = x.legacy && not (!legacy_protocol_and_ciphersuites_allowed) in
+  match x.pid with
+    | FEFork fpid ->
+        let pid_int = Forkhelpers.getpid fpid in
+        if verbose then info "Disconnecting FEFork %d" pid_int;
+        do_disc
+          (fun () ->
+             (if wait then Forkhelpers.waitpid 
+              else Forkhelpers.waitpid_nohang) fpid)
+          pid_int
+    | StdFork pid ->
+        if verbose then info "Disconnecting StdFork %d" pid;
+        do_disc
+          (fun () ->
+             (if wait then Unix.waitpid []
+              else Unix.waitpid [Unix.WNOHANG]) pid)
+          pid
+    | Nopid -> if verbose then info "Disconnecting Nopid"
 
 (* With some probability, stunnel fails during its startup code before it reads
    the config data from us. Therefore we get a SIGPIPE writing the config data.
@@ -188,10 +252,13 @@ let attempt_one_connect ?unique_id ?(use_fork_exec_helper = true)
       ["-fd"; if use_fork_exec_helper then config_out_uuid else config_out_fd]
     end in
   let data_out,data_in = Unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  (* Dereference just once to ensure we are consistent in t and config_file *)
+  let legacy = !legacy_protocol_and_ciphersuites_allowed in
   let t = 
     { pid = Nopid; fd = data_out; host = host; port = port; 
       connected_time = Unix.gettimeofday (); unique_id = unique_id; 
-      logfile = "" } in
+      logfile = ""; verified = verify_cert;
+	  legacy = legacy } in
   let result = Forkhelpers.with_logfile_fd "stunnel"
     ~delete:(not extended_diagnosis)
     (fun logfd ->
@@ -202,8 +269,6 @@ let attempt_one_connect ?unique_id ?(use_fork_exec_helper = true)
 	         Unsafe.Dup2(logfd, Unix.stderr) ] in
        t.pid <-
          if use_fork_exec_helper then begin
-	         let cmdline = Printf.sprintf "Using commandline: %s\n" (String.concat " " (path::args)) in
-	         write_to_log cmdline;
 	         FEFork(Forkhelpers.safe_close_and_exec 
                     (Some data_in) (Some data_in) (Some logfd) configs path args)
          end else
@@ -217,11 +282,9 @@ let attempt_one_connect ?unique_id ?(use_fork_exec_helper = true)
        (* Make sure we close config_in eventually *)
          finally
 	       (fun () ->
-	          let pidmsg = Printf.sprintf "stunnel has pidty: %s" (string_of_pid t.pid) in
-	          write_to_log pidmsg;
             match config_in with
             | Some fd -> begin
-	              let config = config_file verify_cert extended_diagnosis host port in
+	              let config = config_file verify_cert extended_diagnosis host port legacy in
 	              (* Catch the occasional initialisation failure of stunnel: *)
 	              try
 	                let n = Unix.write fd config 0 (String.length config) in
@@ -238,8 +301,7 @@ let attempt_one_connect ?unique_id ?(use_fork_exec_helper = true)
       if extended_diagnosis then begin
         write_to_log "stunnel start";
         t.logfile <- log
-      end else
-        write_to_log ("stunnel start: Log from stunnel: [" ^ log ^ "]");
+      end;
       t
   | Forkhelpers.Failure(log, exn) ->
       write_to_log ("stunnel abort: Log from stunnel: [" ^ log ^ "]");
@@ -257,6 +319,11 @@ let rec retry f = function
 	ignore(Unix.select [] [] [] 3.);
 	retry f (n - 1)
 
+let must_verify_cert verify_cert =
+  match verify_cert with
+  | Some x -> x
+  | None -> Sys.file_exists verify_certificates_ctrl
+
 (** Establish a fresh stunnel to a (host, port)
     @param extended_diagnosis If true, the stunnel log file will not be
     deleted.  Instead, it is the caller's responsibility to delete it.  This
@@ -269,9 +336,7 @@ let connect
 		?(extended_diagnosis=false)
 		host
 		port = 
-	let _verify_cert = match verify_cert with
-		| Some x -> x
-		| None -> Sys.file_exists verify_certificates_ctrl in
+	let _verify_cert = must_verify_cert verify_cert in
   let _ = match write_to_log with 
     | Some logger -> stunnel_logger := logger
     | None -> () in

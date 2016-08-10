@@ -112,7 +112,8 @@ module String :
     (** replace all [f] substring in [s] by [t] *)
     val replace : string -> string -> string -> string
 
-    (** filter chars from a string *)
+    (** choose chars from a string, e.g.
+        "filter_chars isspace s" gives only the whitespace from s *)
     val filter_chars : string -> (char -> bool) -> string
 
     (** map a string trying to fill the buffer by chunk *)
