@@ -141,8 +141,9 @@ let config_file verify_cert extended_diagnosis host port legacy =
 	let lines = [
 		"client=yes"; "foreground=yes"; "socket = r:TCP_NODELAY=1"; "socket = r:SO_KEEPALIVE=1"; "socket = a:SO_KEEPALIVE=1";
 		(match !timeoutidle with None -> "" | Some x -> Printf.sprintf "TIMEOUTidle = %d" x);
-		Printf.sprintf "connect=%s:%d" host port;
-		"fips = no"; (* stunnel fips-mode stops us using sslVersion other than TLSv1 which means 1.0 only. *)
+		Printf.sprintf "connect = %s:%d" host port;
+		"options = NO_SSLv2";
+		"ciphers = " ^ (good_ciphers ()) ^ (match !legacy_ciphersuites with "" -> "" | s -> (":" ^ s))
 	] @	(if extended_diagnosis then
 			["debug=4"]
 		else
@@ -156,14 +157,8 @@ let config_file verify_cert extended_diagnosis host port legacy =
 			[]
 	) @ (
 		if legacy then [
-			"sslVersion = all";
-			"options = NO_SSLv2";
 			"options = NO_SSLv3";
-			"ciphers = " ^ (good_ciphers ()) ^ (match !legacy_ciphersuites with "" -> "" | s -> (":" ^ s))
-		] else [
-			"sslVersion = TLSv1.2";
-			"ciphers = " ^ (good_ciphers ());
-		]
+        ] else []
 	)
   in
     String.concat "" (List.map (fun x -> x ^ "\n") lines)
